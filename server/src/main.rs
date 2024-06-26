@@ -15,7 +15,6 @@ use opencv::videoio::VideoCapture;
 use opencv::videoio::CAP_ANY;
 use std::env;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use warp::ws::Message;
 use warp::ws::WebSocket;
 use warp::Filter;
@@ -27,7 +26,14 @@ fn get_absolute_project_path() -> Option<String> {
     }
 }
 
-fn capture_video(tx: mpsc::UnboundedSender<(Vec<u8>, usize)>) {
+async fn send(
+    ws_tx: &Arc<Mutex<SplitSink<WebSocket, Message>>>,
+    message: Message,
+) -> Result<(), ()> {
+    ws_tx.lock().await.send(message).await.map_err(|_| ())
+}
+
+async fn capture_and_send_frames(ws_tx: Arc<Mutex<SplitSink<WebSocket, Message>>>) {
     let mut cam = match VideoCapture::new(0, CAP_ANY) {
         Ok(cam) => {
             VideoCapture::is_opened(&cam).expect("Unable to open default camera!");
@@ -50,8 +56,6 @@ fn capture_video(tx: mpsc::UnboundedSender<(Vec<u8>, usize)>) {
         }
     };
 
-    println!("Absolute project path: {}", absolute_project_path);
-
     let mut face_cascade = match CascadeClassifier::new(
         &(absolute_project_path + "/model/haarcascade_frontalface_default.xml"),
     ) {
@@ -61,6 +65,8 @@ fn capture_video(tx: mpsc::UnboundedSender<(Vec<u8>, usize)>) {
             return;
         }
     };
+
+    let mut break_loop = false;
 
     loop {
         match cam.read(&mut frame) {
@@ -106,80 +112,64 @@ fn capture_video(tx: mpsc::UnboundedSender<(Vec<u8>, usize)>) {
                         faces.len()
                     );
 
-                    if tx.send((buf.to_vec(), faces.len())).is_err() {
-                        eprintln!("Failed to send frame over WebSocket");
+                    if let Err(err) = send(&ws_tx, Message::binary(buf.to_vec())).await {
+                        eprintln!("Failed to send frame: {:?}", err);
+                        break_loop = true;
+                    };
+
+                    if let Err(err) = send(&ws_tx, Message::text(faces.len().to_string())).await {
+                        eprintln!("Failed to send frame: {:?}", err);
+                        break_loop = true;
                     }
                 }
 
-                std::thread::sleep(std::time::Duration::from_millis(66)); // 15fps 전송 주기
+                tokio::time::sleep(tokio::time::Duration::from_millis(66)).await;
+                // 15fps 전송 주기
             }
             Err(e) => {
                 eprintln!("Failed to read frame: {}", e);
-                continue;
+                break_loop = true;
             }
         }
-    }
-}
 
-async fn send_frame(
-    ws_tx: &Arc<Mutex<SplitSink<WebSocket, Message>>>,
-    message: Message,
-) -> Result<(), ()> {
-    ws_tx.lock().await.send(message).await.map_err(|_| ())
-}
+        println!("break_loop: {}", break_loop);
 
-async fn send_frames(
-    ws_tx: Arc<Mutex<SplitSink<WebSocket, Message>>>,
-    mut rx: mpsc::UnboundedReceiver<(Vec<u8>, usize)>,
-) {
-    while let Some((camera_frame, face_count)) = rx.recv().await {
-        if let Err(_) = send_frame(&ws_tx, Message::binary(camera_frame)).await {
-            eprintln!("Failed to send frame over WebSocket");
-            break;
-        }
-
-        if let Err(_) = send_frame(&ws_tx, Message::text(face_count.to_string())).await {
-            eprintln!("Failed to send face count over WebSocket");
+        if break_loop {
             break;
         }
     }
 }
 
-async fn handle_message(ws_tx: Arc<Mutex<SplitSink<WebSocket, Message>>>, msg: Message) {
-    if let Ok(text) = msg.to_str() {
-        println!("Received message: {}", text);
-
-        if let Err(_) = send_frame(&ws_tx, Message::text("Hello, WebSocket!")).await {
-            eprintln!("Failed to send message back to the client");
-        }
-    }
-}
-
-async fn handle_websocket(ws: WebSocket, rx: mpsc::UnboundedReceiver<(Vec<u8>, usize)>) {
+async fn handle_websocket(ws: WebSocket) {
     let (ws_tx, mut ws_rx) = ws.split();
     let ws_tx = Arc::new(Mutex::new(ws_tx));
 
-    tokio::spawn(send_frames(ws_tx.clone(), rx));
+    tokio::spawn(async move {
+        capture_and_send_frames(ws_tx).await;
+    });
 
     while let Some(result) = ws_rx.next().await {
         match result {
-            Ok(msg) => handle_message(ws_tx.clone(), msg).await,
+            Ok(msg) => {
+                if let Ok(text) = msg.to_str() {
+                    println!("Received message: {}", text);
+                }
+            }
             Err(e) => {
                 eprintln!("WebSocket error: {}", e);
                 break;
             }
         }
     }
+
     println!("WebSocket connection closed.");
 }
 
 #[tokio::main]
 async fn main() {
-    let websocket_route = warp::path("ws").and(warp::ws()).map(|ws: warp::ws::Ws| {
-        let (tx, rx) = mpsc::unbounded_channel();
-        tokio::task::spawn_blocking(move || capture_video(tx));
-        ws.on_upgrade(move |socket| handle_websocket(socket, rx))
-    });
+    let websocket_route = warp::path("ws")
+        .and(warp::ws())
+        .map(|ws: warp::ws::Ws| ws.on_upgrade(handle_websocket));
 
     warp::serve(websocket_route).run(([0, 0, 0, 0], 8080)).await;
 }
