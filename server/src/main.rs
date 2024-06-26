@@ -80,7 +80,7 @@ async fn capture_and_send_frames(ws_tx: Arc<Mutex<SplitSink<WebSocket, Message>>
                         .detect_multi_scale(
                             &gray,
                             &mut faces,
-                            1.2,
+                            1.1,
                             5,
                             0,
                             Size::new(30, 30),
@@ -116,11 +116,6 @@ async fn capture_and_send_frames(ws_tx: Arc<Mutex<SplitSink<WebSocket, Message>>
                         eprintln!("Failed to send frame: {:?}", err);
                         break_loop = true;
                     };
-
-                    if let Err(err) = send(&ws_tx, Message::text(faces.len().to_string())).await {
-                        eprintln!("Failed to send frame: {:?}", err);
-                        break_loop = true;
-                    }
                 }
 
                 tokio::time::sleep(tokio::time::Duration::from_millis(66)).await;
