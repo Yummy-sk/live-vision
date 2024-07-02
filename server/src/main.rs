@@ -127,8 +127,6 @@ async fn capture_and_send_frames(ws_tx: Arc<Mutex<SplitSink<WebSocket, Message>>
             }
         }
 
-        println!("break_loop: {}", break_loop);
-
         if break_loop {
             break;
         }
